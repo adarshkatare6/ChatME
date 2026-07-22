@@ -1,3 +1,14 @@
+"""File upload / download / delete — backed by Supabase Storage.
+
+Files are stored in the `chatme-uploads` bucket under the path:
+    project-{project_id}/{uuid}/{original_filename}
+
+The `openai_file_id` column on FileRecord is reused to hold this storage path
+(no DB migration required).
+"""
+
+import uuid
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
 from sqlmodel import Session, select
@@ -12,7 +23,44 @@ router = APIRouter(prefix="/projects/{project_id}/files", tags=["files"])
 settings = get_settings()
 
 MAX_BYTES = 20 * 1024 * 1024  # 20 MB cap
+BUCKET = "chatme-uploads"
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _require_storage() -> None:
+    """Raise 501 if Supabase Storage is not configured."""
+    if not settings.supabase_url or not settings.supabase_service_key:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "File storage is not configured. "
+                "Set SUPABASE_URL and SUPABASE_SERVICE_KEY on the backend."
+            ),
+        )
+
+
+def _storage_headers(content_type: str | None = None) -> dict:
+    key = settings.supabase_service_key
+    h = {
+        "Authorization": f"Bearer {key}",
+        "apikey": key,
+    }
+    if content_type:
+        h["Content-Type"] = content_type
+    return h
+
+
+def _object_url(storage_path: str) -> str:
+    base = settings.supabase_url.rstrip("/")
+    return f"{base}/storage/v1/object/{BUCKET}/{storage_path}"
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @router.post("", response_model=FileRead, status_code=status.HTTP_201_CREATED)
 async def upload_file(
@@ -20,6 +68,8 @@ async def upload_file(
     project: Project = Depends(get_owned_project),
     session: Session = Depends(get_session),
 ) -> FileRecord:
+    _require_storage()
+
     data = await file.read()
     if len(data) > MAX_BYTES:
         raise HTTPException(
@@ -27,51 +77,38 @@ async def upload_file(
             detail=f"File exceeds {MAX_BYTES // (1024 * 1024)} MB limit",
         )
 
-    api_key = settings.effective_openai_api_key
-    if not api_key:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OPENAI_API_KEY is not configured on the backend.",
-        )
+    safe_name = file.filename or "upload"
+    storage_path = f"project-{project.id}/{uuid.uuid4().hex}/{safe_name}"
+    content_type = file.content_type or "application/octet-stream"
 
-    # Forward directly to OpenAI Files API without saving to local disk
-    headers = {"Authorization": f"Bearer {api_key}"}
-    files_payload = {
-        "file": (
-            file.filename or "upload",
-            data,
-            file.content_type or "application/octet-stream",
-        ),
-        "purpose": (None, "assistants"),
-    }
+    headers = _storage_headers(content_type)
+    headers["x-upsert"] = "false"
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                "https://api.openai.com/v1/files",
+                _object_url(storage_path),
                 headers=headers,
-                files=files_payload,
+                content=data,
             )
             resp.raise_for_status()
-            res_data = resp.json()
-            openai_file_id = res_data["id"]
     except httpx.HTTPStatusError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"OpenAI Files API returned error ({e.response.status_code}): {e.response.text[:200]}",
+            detail=f"Supabase Storage upload failed ({e.response.status_code}): {e.response.text[:300]}",
         )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to upload file to OpenAI: {e}",
+            detail=f"Failed to upload file: {e}",
         )
 
     record = FileRecord(
         project_id=project.id,
-        filename=file.filename or "upload",
-        openai_file_id=openai_file_id,
+        filename=safe_name,
+        openai_file_id=storage_path,   # repurposed: stores Supabase storage path
         size=len(data),
-        content_type=file.content_type or "",
+        content_type=content_type,
     )
     session.add(record)
     session.commit()
@@ -99,35 +136,29 @@ async def download_file(
     project: Project = Depends(get_owned_project),
     session: Session = Depends(get_session),
 ) -> Response:
+    _require_storage()
+
     record = session.get(FileRecord, file_id)
     if record is None or record.project_id != project.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
-    api_key = settings.effective_openai_api_key
-    if not api_key:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OPENAI_API_KEY is not configured.",
-        )
-
-    headers = {"Authorization": f"Bearer {api_key}"}
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.get(
-                f"https://api.openai.com/v1/files/{record.openai_file_id}/content",
-                headers=headers,
+                _object_url(record.openai_file_id),
+                headers=_storage_headers(),
             )
             resp.raise_for_status()
             content = resp.content
     except httpx.HTTPStatusError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"OpenAI Files API error: {e.response.text[:200]}",
+            detail=f"Supabase Storage download failed: {e.response.text[:200]}",
         )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to fetch file content from OpenAI: {e}",
+            detail=f"Failed to fetch file: {e}",
         )
 
     return Response(
@@ -147,17 +178,18 @@ async def delete_file(
     if record is None or record.project_id != project.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
-    api_key = settings.effective_openai_api_key
-    if api_key and record.openai_file_id:
-        headers = {"Authorization": f"Bearer {api_key}"}
+    # Best-effort: delete from Supabase Storage (don't block DB deletion on failure)
+    if settings.supabase_url and settings.supabase_service_key and record.openai_file_id:
+        headers = _storage_headers("application/json")
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.delete(
-                    f"https://api.openai.com/v1/files/{record.openai_file_id}",
+                    f"{settings.supabase_url.rstrip('/')}/storage/v1/object/{BUCKET}",
                     headers=headers,
+                    json={"prefixes": [record.openai_file_id]},
                 )
         except Exception:
-            pass  # Proceed with DB row deletion even if OpenAI deletion succeeds or fails
+            pass  # Always delete DB row even if storage deletion fails
 
     session.delete(record)
     session.commit()

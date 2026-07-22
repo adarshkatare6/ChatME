@@ -22,8 +22,14 @@ class Settings(BaseSettings):
     llm_model: str = "openai/gpt-4o-mini"
     llm_timeout_s: float = 60.0
 
-    # --- OpenAI Files API / Storage / CORS ---
+    # --- OpenAI (optional, only needed if using OpenAI Files API for file storage) ---
     openai_api_key: str = ""
+
+    # --- Supabase Storage (free alternative to OpenAI Files for file uploads) ---
+    supabase_url: str = ""           # e.g. https://xxxx.supabase.co
+    supabase_service_key: str = ""   # service_role key from Supabase dashboard → API
+
+    # --- CORS ---
     cors_origins: str = "http://localhost:5173"
 
     @property
