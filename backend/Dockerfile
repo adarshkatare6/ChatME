@@ -9,5 +9,5 @@ RUN pip install -r requirements.txt
 COPY app ./app
 
 EXPOSE 8000
-# Single worker keeps the SQLite default safe. For Postgres, raise --workers.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Use shell form so Render's $PORT env variable is expanded at runtime.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
