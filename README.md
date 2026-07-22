@@ -1,102 +1,102 @@
-# Chatbot Platform
+# ChatME
 
-A minimal, production-shaped chatbot platform: users register/log in, create **agents** (projects) with their own system prompt and model, attach reusable prompt templates and files, and chat against any OpenAI-compatible LLM (OpenRouter, OpenAI, local vLLM, …).
+A full-stack multi-agent chatbot platform allowing users to configure distinct AI agents, manage prompt templates, upload files, and maintain multi-thread chat histories across OpenAI-compatible LLM providers.
 
-**Stack:** FastAPI + SQLModel + JWT (backend) · React + Vite + React Router (frontend) · SQLite (default) / Postgres (compose).
+## Live Demo
 
----
-
-## Features → Requirements map
-
-| Requirement | Where |
-|---|---|
-| Auth (JWT) + register/login by email+password | `backend/app/routers/auth.py`, `security.py`, `deps.py` |
-| User accounts | `User` model, `/auth/register` |
-| Create project/agent under a user | `routers/projects.py` (owner-scoped) |
-| Store & associate prompts with a project | `routers/prompts.py`, `Prompt` model |
-| Chat via LLM API | `routers/chat.py` + pluggable `llm.py` (OpenAI/OpenRouter compatible) |
-| File upload (good-to-have) | `routers/files.py` (+ OpenAI Files API extension point noted inline) |
+**Live demo:** [https://chat-me-teal-rho.vercel.app/](https://chat-me-teal-rho.vercel.app/)
 
 ---
 
-## Run locally (SQLite, no Docker)
+## How to Run
 
-**1. Backend**
+> You can try the application instantly without local setup via the [Live Demo](https://chat-me-teal-rho.vercel.app/).
+
+### 1. Backend Setup
+
 ```bash
 cd backend
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+
+# Create & activate virtual environment
+python -m venv .venv
+.venv\Scripts\activate        # On Windows
+# source .venv/bin/activate   # On macOS/Linux
+
+# Install dependencies
 pip install -r requirements.txt
-cp .env.example .env                                   # then set LLM_API_KEY + JWT_SECRET
-uvicorn app.main:app --reload                          # http://localhost:8000  (docs at /docs)
+
+# Create environment file
+copy .env.example .env        # On Windows
+# cp .env.example .env        # On macOS/Linux
 ```
 
-Generate a real JWT secret:
+Configure your local `backend/.env` with variable names (no secrets needed for basic startup):
+```env
+JWT_SECRET=your_jwt_secret
+ACCESS_TOKEN_TTL_MIN=1440
+LLM_BASE_URL=https://api.groq.com/openai/v1
+LLM_API_KEY=your_llm_api_key
+LLM_MODEL=llama-3.1-8b-instant
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_SERVICE_KEY=your_supabase_service_key
+CORS_ORIGINS=http://localhost:5173
+```
+
+Start the FastAPI server:
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(48))"
+uvicorn app.main:app --reload --port 8000
 ```
+*API documentation is available locally at [http://localhost:8000/docs](http://localhost:8000/docs).*
 
-**2. Frontend**
+### 2. Frontend Setup
+
 ```bash
 cd frontend
+
+# Install dependencies
 npm install
-npm run dev                                            # http://localhost:5173
-```
-The Vite dev server proxies `/api` → `http://localhost:8000`, so no CORS setup is needed in dev.
 
-**3. Smoke test the backend** (patches the LLM, needs no API key)
-```bash
-cd backend && python test_smoke.py                     # 25 checks across auth/projects/prompts/chat/files
+# Start Vite development server
+npm run dev
 ```
+*Access the frontend UI at [http://localhost:5173](http://localhost:5173).*
 
 ---
 
-## Run with Docker (Postgres)
+## Features → Requirements
 
-```bash
-export LLM_API_KEY=sk-...          # or set in a .env next to docker-compose.yml
-export JWT_SECRET=$(python -c "import secrets;print(secrets.token_urlsafe(48))")
-docker compose up --build          # API on :8000, Postgres on :5432
-```
-Run the frontend separately (`npm run dev`) or deploy it statically (see below).
+| Requirement | Implementation Status & Details |
+|---|---|
+| **Login (email + password)** | Implemented via OAuth2 password flow with bcrypt password hashing and stateless PyJWT authentication (`app/routers/auth.py`, `app/security.py`). |
+| **Create a project/agent under a user** | Implemented (`app/routers/projects.py`). Users can create, update, list, and delete isolated agent projects with system prompts and custom models. |
+| **Store prompts tied to a project/agent** | Implemented (`app/routers/prompts.py`). Reusable prompt templates are created per project and dynamically selected during chat turns as system context. |
+| **Chat interface using an LLM API** | Implemented (`app/routers/chat.py`, `app/llm.py`). Supports both OpenAI Responses API (`/v1/responses`) and OpenAI-compatible `/chat/completions` (e.g. Groq, OpenRouter). |
+| **Upload files into a project** | Implemented (`app/routers/files.py`). Uploads are proxied directly to cloud storage (Supabase Storage) with database record tracking and size validation. |
 
----
-
-## LLM provider
-
-Point three env vars at any OpenAI-compatible gateway — nothing else changes:
-
-```env
-LLM_BASE_URL=https://openrouter.ai/api/v1      # or https://api.openai.com/v1
-LLM_API_KEY=sk-...
-LLM_MODEL=openai/gpt-4o-mini                    # or anthropic/claude-3.5-sonnet, etc.
-```
-
-A per-agent **model override** field lets each project pin its own model. To use a
-non-compatible provider (e.g. the OpenAI *Responses* API), subclass `LLMProvider`
-in `backend/app/llm.py` and return it from `get_provider()`.
+### Additional Features Implemented Beyond Requirements
+- **Multi-Conversation Threading**: Projects host multiple isolated conversation threads with auto-generated titles and thread switching.
+- **Strict Ownership Security**: Centralized FastAPI dependencies (`get_owned_project`, `get_owned_conversation`) guarantee strict per-user data isolation and prevent cross-tenant resource leakage (404 on access violations).
+- **Dual LLM Provider Protocol**: Clean abstract provider (`LLMProvider`) supporting stateful `previous_response_id` chaining (OpenAI) and context replay (Groq / OpenRouter).
+- **Cloud Object Storage Integration**: Direct streaming file uploads and downloads powered by Supabase Storage.
 
 ---
 
-## Deploy
+## Architecture
 
-- **Backend:** any container host (Render / Railway / Fly.io / Cloud Run) using `backend/Dockerfile`. Set the env vars above; use Postgres in production.
-- **Frontend:** `npm run build` → static `dist/`. Host on Vercel / Netlify / Cloudflare Pages. Set `VITE_API_BASE` to the deployed API origin at build time, and add that frontend origin to the backend `CORS_ORIGINS`.
+![Architecture & Database Schema](archi_DB.png)
 
 ---
 
-## API surface
+## Tech Stack
 
-```
-POST   /auth/register                 POST /auth/login          GET  /auth/me
-GET    /projects                      POST /projects
-GET    /projects/{id}                 PATCH /projects/{id}      DELETE /projects/{id}
-GET    /projects/{id}/prompts         POST /projects/{id}/prompts   DELETE …/prompts/{pid}
-POST   /projects/{id}/chat            GET  /projects/{id}/messages
-POST   /projects/{id}/files           GET  /projects/{id}/files
-GET    /projects/{id}/files/{fid}/download   DELETE …/files/{fid}
-GET    /health
-```
-
-Interactive docs (Swagger) auto-generated at `/docs`.
-
-See `ARCHITECTURE.md` for the design rationale and how each non-functional requirement is addressed.
+| Layer | Technology Used |
+|---|---|
+| **Frontend Framework** | React 18 + Vite |
+| **Frontend Routing & Styling** | React Router v6 + Custom Vanilla CSS |
+| **Backend Framework** | FastAPI (Python 3.12) |
+| **Database & ORM** | Supabase (PostgreSQL) / SQLite + SQLModel (SQLAlchemy + Pydantic) |
+| **Authentication** | PyJWT + bcrypt |
+| **LLM Provider** | Groq (`llama-3.1-8b-instant`) / OpenAI (`/v1/responses`) |
+| **File Storage** | Supabase Storage |
+| **HTTP Client** | `httpx` (async) |
+| **Hosting & Deployment** | Vercel (Frontend) + Render Docker (Backend) |

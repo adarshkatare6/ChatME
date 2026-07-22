@@ -1,3 +1,6 @@
+# Local-only documents (never commit)
+PROJECT_OVERVIEW.md
+
 # Environment & Secrets
 .env
 .env.local
